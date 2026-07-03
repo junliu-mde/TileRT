@@ -213,7 +213,7 @@ def main():
     p_cross.add_argument("--hf-model-path", required=True)
     p_cross.add_argument("--disable-mtp", action="store_true")
     p_cross.add_argument("--prefill-tp-size", type=int, default=8)
-    p_cross.add_argument("--prefill-mem-fraction", type=float, default=0.3)
+    p_cross.add_argument("--prefill-mem-fraction", type=float, default=0.85)
     p_cross.set_defaults(func=cmd_cross)
 
     args = parser.parse_args()
