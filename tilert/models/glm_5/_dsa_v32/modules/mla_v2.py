@@ -17,9 +17,7 @@ from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projq_wqi import (
     RmsnormProjqWqi,
     RmsnormProjqWqiAlgorithm,
 )
-from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqakis import (
-    RMSNormProjxWqakis,
-)
+from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqakis import RMSNormProjxWqakis
 from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqkva import (
     RMSNormProjxWqkva,
     RMSNormProjxWqkvaAlgorithm,
@@ -28,6 +26,10 @@ from tilert.models.glm_5._dsa_v32.ops.unproj_o_allreduce import (
     UnProjOAllReduce,
     UnProjOAllReduceAlgorithm,
 )
+
+
+def _minimal_cache_placeholder(device: str) -> torch.Tensor:
+    return torch.empty(1, dtype=torch.bfloat16, device=device)
 
 
 class SparseSelectMlaV2(SerializableTileRTModule):
@@ -94,22 +96,15 @@ class SparseSelectMlaV2(SerializableTileRTModule):
         """Return [ki_cache, kv_cache, pe_cache] matching DsaCacheVars layout."""
         cache_seq_len = self.model_args.max_seq_len + self.model_args.kv_cache_pad
         bs_args = (self.model_args.max_batch_size, cache_seq_len)
+        device = f"cuda:{self.device_id}"
 
         if self.ki_cache is None:
             ki_dim = self.model_args.index_head_dim
-            self.ki_cache = torch.zeros(
-                *bs_args, ki_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            self.ki_cache = torch.zeros(*bs_args, ki_dim, dtype=torch.bfloat16, device=device)
         if self.kv_cache is None:
-            kv_dim = self.model_args.kv_lora_rank
-            self.kv_cache = torch.zeros(
-                *bs_args, kv_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            self.kv_cache = _minimal_cache_placeholder(device)
         if self.pe_cache is None:
-            pe_dim = self.model_args.qk_rope_head_dim
-            self.pe_cache = torch.zeros(
-                *bs_args, pe_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            self.pe_cache = _minimal_cache_placeholder(device)
         return [*super().get_cache_vars(), self.ki_cache, self.kv_cache, self.pe_cache]
 
 
@@ -229,20 +224,14 @@ class PureMlaV2(SerializableTileRTModule):
         """Return [ki_cache, kv_cache, pe_cache] matching DsaCacheVars layout."""
         cache_seq_len = self.model_args.max_seq_len + self.model_args.kv_cache_pad
         bs_args = (self.model_args.max_batch_size, cache_seq_len)
+        device = f"cuda:{self.device_id}"
 
         if self.ki_cache is None:
-            ki_dim = self.model_args.index_head_dim
-            self.ki_cache = torch.zeros(
-                *bs_args, ki_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            self.ki_cache = _minimal_cache_placeholder(device)
         if self.kv_cache is None:
             kv_dim = self.model_args.kv_lora_rank
-            self.kv_cache = torch.zeros(
-                *bs_args, kv_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            self.kv_cache = torch.zeros(*bs_args, kv_dim, dtype=torch.bfloat16, device=device)
         if self.pe_cache is None:
             pe_dim = self.model_args.qk_rope_head_dim
-            self.pe_cache = torch.zeros(
-                *bs_args, pe_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            self.pe_cache = torch.zeros(*bs_args, pe_dim, dtype=torch.bfloat16, device=device)
         return [*super().get_cache_vars(), self.ki_cache, self.kv_cache, self.pe_cache]

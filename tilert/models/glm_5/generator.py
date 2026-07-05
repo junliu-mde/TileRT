@@ -34,6 +34,7 @@ class GLM5Generator:
         use_topp: bool = False,
         enable_thinking: bool = False,
         sampling_seed: int = 42,
+        mtp_cache_mode: int | None = None,
     ):
         """Initialize the ShowHandsGeneratorGlm5.
 
@@ -59,6 +60,7 @@ class GLM5Generator:
         self.use_topp = use_topp
         self.enable_thinking = enable_thinking
         self.sampling_seed = sampling_seed
+        self.mtp_cache_mode = mtp_cache_mode
 
         self.config = model_args
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -117,6 +119,9 @@ class GLM5Generator:
         self._seq_time_list: list[float] = []
         self._seq_accepted_counts: list[int] = []
         self._seq_output_tokens: list[int] = []
+        self._seq_next_draft_tokens_cpu: torch.Tensor | None = None
+        self._seq_decode_forward_seconds = 0.0
+        self._seq_decode_post_seconds = 0.0
 
     def init(self) -> None:
         """Initialize the ShowHandsGeneratorGlm5."""
@@ -133,6 +138,12 @@ class GLM5Generator:
     def from_pretrained(self) -> None:
         """Load the model weights from the given path."""
         self.decode_layer.from_pretrained(self.model_weights_dir)
+        if self.mtp_cache_mode is not None:
+            if hasattr(self.decode_layer, "set_mtp_cache_mode"):
+                self.decode_layer.set_mtp_cache_mode(self.mtp_cache_mode)
+            else:
+                torch.ops.tilert.dsa_mtp_e2e_show_hands_set_cache_mode_glm5(self.mtp_cache_mode)
+            logger.info("Set TileRT MTP cache mode to %s", self.mtp_cache_mode)
 
     def extract_ffn_cache(self) -> tuple[dict[int, list], dict[int, set[str]]]:
         """Extract MOE/MLP op objects and skip keys from current loaded weights.
@@ -241,6 +252,18 @@ class GLM5Generator:
         if sampling_params is None:
             return
 
+        temperature = getattr(sampling_params, "temperature", self.temperature)
+        top_p = getattr(sampling_params, "top_p", self.top_p)
+        top_k = getattr(sampling_params, "top_k", self.top_k)
+        if top_k is None or int(top_k) < 0:
+            top_k = self._default_top_k
+        self.update_sampling_params(
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+            use_topp=bool(float(top_p) < 1.0),
+        )
+
         max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
         if max_new_tokens is not None:
             self.max_new_tokens = int(max_new_tokens)
@@ -258,12 +281,16 @@ class GLM5Generator:
         self._seq_total_len = 0
         self._seq_prev_pos = 0
         self._seq_cur_pos = 0
+        self._seq_last_prompt_token = 0
         self._seq_prefill_done = False
         self._seq_prefill_pos = 0
         self._seq_finished = False
         self._seq_time_list = []
         self._seq_accepted_counts = []
         self._seq_output_tokens = []
+        self._seq_next_draft_tokens_cpu = None
+        self._seq_decode_forward_seconds = 0.0
+        self._seq_decode_post_seconds = 0.0
 
     def _init_sequence_tensors(self, prompt_tokens: list[int]) -> None:
         if not prompt_tokens:
@@ -287,6 +314,7 @@ class GLM5Generator:
         self._seq_prompt_mask = tokens != -1
         self._seq_prompt_len = prompt_len
         self._seq_total_len = total_len
+        self._seq_last_prompt_token = int(prompt_tokens[-1])
         self._seq_finished = total_len <= prompt_len
         self._seq_prefill_done = prompt_len <= 1
         self._seq_prefill_pos = 0 if self._seq_active_mtp else 1
@@ -553,37 +581,49 @@ class GLM5Generator:
             return []
 
         if self._seq_cur_pos == self._seq_prompt_len - 1:
-            last_token = self._seq_tokens[0, self._seq_prompt_len - 1].item()
             draft_tokens = torch.full(
-                (self.mtp_seq_len,),
-                last_token,
-                dtype=torch.long,
-                device=self.default_device,
+                (1, self.mtp_seq_len),
+                self._seq_last_prompt_token,
+                dtype=torch.int32,
             )
-            draft_tokens = draft_tokens.reshape(1, self.mtp_seq_len).to(torch.int32)
         else:
-            draft_tokens = self.decode_layer.get_next_draft_tokens(0).reshape(1, self.mtp_seq_len)
+            draft_tokens = self._seq_next_draft_tokens_cpu
+            if draft_tokens is None:
+                draft_tokens = (
+                    self.decode_layer.get_next_draft_tokens(0)
+                    .reshape(1, self.mtp_seq_len)
+                    .detach()
+                    .cpu()
+                )
 
         start_time = time.time()
         self.decode_layer.forward(draft_tokens, with_mtp=True)
         end_time = time.time()
-        self._seq_time_list.append(end_time - start_time)
+        forward_seconds = end_time - start_time
+        self._seq_time_list.append(forward_seconds)
+        self._seq_decode_forward_seconds += forward_seconds
 
+        post_start_time = time.time()
         num_accepted = int(self.decode_layer.get_num_accepted(0))
         if num_accepted <= 0:
             raise RuntimeError("TileRT MTP returned no accepted tokens")
 
         predicted_tokens = self.decode_layer.get_predicted_tokens(0).flatten()
+        self._seq_next_draft_tokens_cpu = (
+            self.decode_layer.get_next_draft_tokens(0).reshape(1, self.mtp_seq_len).detach().cpu()
+        )
         self._seq_accepted_counts.append(num_accepted)
 
-        output_tokens: list[int] = []
-        for i in range(num_accepted):
-            token_pos = self._seq_cur_pos + 1 + i
-            if token_pos >= self._seq_total_len:
-                break
+        remaining_slots = self._seq_total_len - self._seq_cur_pos - 1
+        if remaining_slots <= 0:
+            self._seq_finished = True
+            self._seq_decode_post_seconds += time.time() - post_start_time
+            return []
 
-            new_token = int(predicted_tokens[i].item())
-            self._seq_tokens[0, token_pos] = new_token
+        num_output_tokens = min(num_accepted, remaining_slots)
+        output_tokens = []
+        for new_token in predicted_tokens[:num_output_tokens].detach().cpu().tolist():
+            new_token = int(new_token)
             output_tokens.append(new_token)
             self._seq_output_tokens.append(new_token)
 
@@ -595,6 +635,7 @@ class GLM5Generator:
         if self._seq_cur_pos >= self._seq_total_len - 1:
             self._seq_finished = True
 
+        self._seq_decode_post_seconds += time.time() - post_start_time
         return output_tokens
 
     def is_sequence_finished(self) -> bool:
@@ -608,6 +649,59 @@ class GLM5Generator:
             len(self._seq_output_tokens),
             self._seq_prefill_done,
         )
+
+    def sequence_decode_stats(self, since_step: int = 0) -> dict[str, int | float | bool]:
+        """Return decode-only progress counters for the active sequence."""
+        output_tokens = len(self._seq_output_tokens)
+        if self._seq_active_mtp:
+            accepted_counts = self._seq_accepted_counts
+            decode_steps = len(accepted_counts)
+            accepted_total = sum(accepted_counts)
+            if decode_steps:
+                accepted_min = min(accepted_counts)
+                accepted_max = max(accepted_counts)
+                accepted_avg = accepted_total / decode_steps
+            else:
+                accepted_min = 0
+                accepted_max = 0
+                accepted_avg = 0.0
+
+            if since_step < 0:
+                since_step = 0
+            if since_step > decode_steps:
+                since_step = decode_steps
+            recent_counts = accepted_counts[since_step:]
+            recent_steps = len(recent_counts)
+            recent_total = sum(recent_counts)
+            recent_avg = recent_total / recent_steps if recent_steps else 0.0
+        else:
+            decode_steps = output_tokens
+            accepted_total = output_tokens
+            accepted_min = 1 if output_tokens else 0
+            accepted_max = 1 if output_tokens else 0
+            accepted_avg = 1.0 if output_tokens else 0.0
+            if since_step < 0:
+                since_step = 0
+            if since_step > decode_steps:
+                since_step = decode_steps
+            recent_steps = decode_steps - since_step
+            recent_total = recent_steps
+            recent_avg = 1.0 if recent_steps else 0.0
+
+        return {
+            "with_mtp": self._seq_active_mtp,
+            "output_tokens": output_tokens,
+            "decode_steps": decode_steps,
+            "accepted_total": accepted_total,
+            "accepted_avg": accepted_avg,
+            "accepted_min": accepted_min,
+            "accepted_max": accepted_max,
+            "recent_steps": recent_steps,
+            "recent_accepted_total": recent_total,
+            "recent_accepted_avg": recent_avg,
+            "forward_seconds": self._seq_decode_forward_seconds,
+            "post_seconds": self._seq_decode_post_seconds,
+        }
 
     def _completion_tokens_for_decode(self) -> list[int]:
         stop_idx = len(self._seq_output_tokens)
@@ -757,19 +851,32 @@ class GLM5Generator:
             self.decode_layer._get_device_result(device_id)[1] for device_id in range(num_devices)
         ]
 
-        # Stage each layer on device 0 once (single H2D copy), then fan out to
-        # the remaining devices over NVLink instead of 8 separate host copies.
+        # TileRT's megakernel does not keep a full cache replica on every GPU:
+        # the DSA indexer key (ki) is consumed on device 0, while the MLA
+        # latent/rope caches (kv/pe) are consumed on devices 1..N-1. Avoid
+        # populating unused tensors; for long prompts this removes most of the
+        # host/device copy traffic from external-prefill injection.
         for layer_id, (ki, kv, pe) in enumerate(layer_caches):
             base_idx = layer_id * 3
-            srcs = (
-                ki[:cache_len].to("cuda:0", non_blocking=True),
-                kv[:cache_len].to("cuda:0", non_blocking=True),
-                pe[:cache_len].to("cuda:0", non_blocking=True),
+            device_caches[0][base_idx + 0][0, start_pos:end_pos, :].copy_(
+                ki[:cache_len],
+                non_blocking=True,
             )
-            for device_id in range(num_devices):
+
+            if num_devices == 1:
+                kv_device_ids = (0,)
+            else:
+                kv_device_ids = range(1, num_devices)
+            for device_id in kv_device_ids:
                 caches = device_caches[device_id]
-                for i, src in enumerate(srcs):
-                    caches[base_idx + i][0, start_pos:end_pos, :].copy_(src, non_blocking=True)
+                caches[base_idx + 1][0, start_pos:end_pos, :].copy_(
+                    kv[:cache_len],
+                    non_blocking=True,
+                )
+                caches[base_idx + 2][0, start_pos:end_pos, :].copy_(
+                    pe[:cache_len],
+                    non_blocking=True,
+                )
 
         for device_id in range(num_devices):
             torch.cuda.synchronize(device_id)

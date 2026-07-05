@@ -134,6 +134,14 @@ def dsa_show_hands_set_sampling_seed(
     return getattr(torch.ops.tilert, func_name)(seed)
 
 
+def dsa_mtp_e2e_show_hands_set_cache_mode(cache_mode: int, is_glm5: bool = False) -> Any:
+    """Set the native MTP cache mode."""
+    mtp_flag = "_mtp_e2e"
+    glm5_flag = "_glm5" if is_glm5 else ""
+    func_name = f"dsa{mtp_flag}_show_hands_set_cache_mode{glm5_flag}"
+    return getattr(torch.ops.tilert, func_name)(cache_mode)
+
+
 def dsa_mtp_e2e_show_hands_set_prefill_valid_tokens(
     num_valid_tokens: int, is_glm5: bool = False
 ) -> Any:
@@ -568,6 +576,11 @@ class ShowHandsDSALayer:
         """
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
         dsa_show_hands_set_sampling_seed(seed, active_mtp, self.is_glm5)
+
+    def set_mtp_cache_mode(self, cache_mode: int) -> None:
+        if not self.with_mtp:
+            raise RuntimeError("TileRT MTP cache mode requires with_mtp=True")
+        dsa_mtp_e2e_show_hands_set_cache_mode(cache_mode, self.is_glm5)
 
     def reset_sequence(self) -> None:
         if self.with_mtp:

@@ -182,8 +182,11 @@ def cmd_cross(args):
         trust_remote_code=True,
         tp_size=args.prefill_tp_size,
         mem_fraction_static=args.prefill_mem_fraction,
-        kv_cache_dtype="bfloat16",
-        disable_cuda_graph=True,
+        kv_cache_dtype="fp8_e4m3",
+        attention_backend="dsa",
+        dsa_prefill_backend="trtllm",
+        dsa_decode_backend="trtllm",
+        disable_cuda_graph=False,
         log_level="warning",
     )
     engine.generate(

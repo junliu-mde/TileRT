@@ -5,11 +5,13 @@ decode layer; kernel-level correctness is covered by
 scripts/verify_external_prefill.py on an 8-GPU node.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+from tilert.models.glm_5._dsa_v32.modules.mla_v2 import PureMlaV2, SparseSelectMlaV2
 from tilert.models.glm_5.generator import GLM5Generator
 from tilert.models.glm_5.model_args import ModelArgsGLM5
 
@@ -25,6 +27,7 @@ def make_generator(with_mtp: bool) -> GLM5Generator:
     gen.temperature = 1.0
     gen.top_p = 0.9
     gen.top_k = 1
+    gen._default_top_k = 1
     gen.use_topp = False
     gen.sampling_seed = 42
     gen.batch_size = 1
@@ -49,6 +52,71 @@ def make_layer_caches(rows: int) -> list[tuple[torch.Tensor, torch.Tensor, torch
         )
         for _ in range(N_LAYERS)
     ]
+
+
+def test_sequence_decode_stats_reports_mtp_acceptance():
+    gen = make_generator(with_mtp=True)
+    gen._seq_active_mtp = True
+    gen._seq_output_tokens = [101, 102, 103, 104, 105, 106]
+    gen._seq_accepted_counts = [1, 4, 1]
+
+    stats = gen.sequence_decode_stats(since_step=1)
+
+    assert stats["with_mtp"] is True
+    assert stats["output_tokens"] == 6
+    assert stats["decode_steps"] == 3
+    assert stats["accepted_total"] == 6
+    assert stats["accepted_avg"] == 2.0
+    assert stats["accepted_min"] == 1
+    assert stats["accepted_max"] == 4
+    assert stats["recent_steps"] == 2
+    assert stats["recent_accepted_total"] == 5
+    assert stats["recent_accepted_avg"] == 2.5
+
+
+def test_sequence_decode_stats_reports_non_mtp_as_single_acceptance():
+    gen = make_generator(with_mtp=False)
+    gen._seq_active_mtp = False
+    gen._seq_output_tokens = [101, 102, 103]
+
+    stats = gen.sequence_decode_stats(since_step=99)
+
+    assert stats["with_mtp"] is False
+    assert stats["output_tokens"] == 3
+    assert stats["decode_steps"] == 3
+    assert stats["accepted_total"] == 3
+    assert stats["accepted_avg"] == 1.0
+    assert stats["accepted_min"] == 1
+    assert stats["accepted_max"] == 1
+    assert stats["recent_steps"] == 0
+    assert stats["recent_accepted_total"] == 0
+    assert stats["recent_accepted_avg"] == 0.0
+
+
+def test_update_sampling_from_request_updates_decode_layer_config():
+    gen = make_generator(with_mtp=True)
+    params = SimpleNamespace(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        max_new_tokens=7,
+        sampling_seed=1234,
+    )
+
+    gen._update_sampling_from_request(params)
+
+    assert gen.temperature == 0.0
+    assert gen.top_p == 1.0
+    assert gen.top_k == gen._default_top_k
+    assert gen.use_topp is False
+    assert gen.max_new_tokens == 7
+    assert gen.sampling_seed == 1234
+    gen.decode_layer.update_sampling_config.assert_called_once_with(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=gen._default_top_k,
+        use_topp=False,
+    )
 
 
 def test_prompt_to_tokens_accepts_batch_encoding_shape():
@@ -193,6 +261,31 @@ def test_next_tokens_routes_to_decode_after_full_injection():
     gen._next_tokens_with_mtp.assert_called_once()
 
 
+def test_next_tokens_with_mtp_commits_predicted_tokens_until_stop():
+    gen = make_generator(with_mtp=True)
+    gen._seq_active_mtp = True
+    gen._sequence_active = True
+    gen._seq_prompt_len = 3
+    gen._seq_total_len = 10
+    gen._seq_cur_pos = 3
+    gen._seq_prefill_done = True
+    gen._seq_tokens = torch.full((1, 10), -1, dtype=torch.long)
+    gen._seq_output_tokens = [100]
+    gen.decode_layer.get_next_draft_tokens.return_value = torch.tensor(
+        [[11, 12, 13, 14]], dtype=torch.int32
+    )
+    gen.decode_layer.get_num_accepted.return_value = 4
+    gen.decode_layer.get_predicted_tokens.return_value = torch.tensor(
+        [[201, 202, 2, 204]], dtype=torch.int32
+    )
+
+    assert gen.next_tokens() == [201, 202, 2]
+    assert gen._seq_output_tokens == [100, 201, 202, 2]
+    assert gen._seq_cur_pos == 6
+    assert gen._seq_finished
+    assert gen._seq_accepted_counts == [4]
+
+
 def test_extract_cache_layout():
     gen = make_generator(with_mtp=False)
     caches = []
@@ -208,3 +301,82 @@ def test_extract_cache_layout():
     ki, kv, pe = out[3]
     assert ki.shape == (5, 128) and kv.shape == (5, 512) and pe.shape == (5, 64)
     assert torch.all(kv == 3.0)
+
+
+def test_inject_cache_copies_host_tensors_directly(monkeypatch):
+    gen = make_generator(with_mtp=False)
+    gen.inject_cache = GLM5Generator.inject_cache.__get__(gen, GLM5Generator)
+    gen.decode_layer.num_devices = 3
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device_id: None)
+
+    device_caches = [_make_device_caches(rows=8) for _ in range(gen.decode_layer.num_devices)]
+    gen.decode_layer._get_device_result.side_effect = [
+        (None, device_caches[0], None, None),
+        (None, device_caches[1], None, None),
+        (None, device_caches[2], None, None),
+    ]
+    layer_caches = []
+    for layer_id in range(N_LAYERS):
+        layer_caches.append(
+            (
+                torch.full((4, 128), 10 + layer_id, dtype=torch.bfloat16),
+                torch.full((4, 512), 20 + layer_id, dtype=torch.bfloat16),
+                torch.full((4, 64), 30 + layer_id, dtype=torch.bfloat16),
+            )
+        )
+
+    gen.inject_cache(layer_caches, start_pos=2, end_pos=6)
+
+    assert torch.all(device_caches[0][0][0, 2:6, :] == 10)
+    assert torch.all(device_caches[0][1] == 0)
+    assert torch.all(device_caches[0][2] == 0)
+    for caches in device_caches[1:]:
+        assert torch.all(caches[0] == 0)
+        assert torch.all(caches[1][0, 2:6, :] == 20)
+        assert torch.all(caches[2][0, 2:6, :] == 30)
+
+
+def test_sparse_select_mla_allocates_only_index_cache(monkeypatch):
+    monkeypatch.setattr(torch, "zeros", _cpu_tensor_factory(torch.zeros))
+    monkeypatch.setattr(torch, "empty", _cpu_tensor_factory(torch.empty))
+    args = ModelArgsGLM5(max_seq_len=17, kv_cache_pad=3, max_batch_size=2)
+
+    caches = SparseSelectMlaV2(args, device_id=0, num_devices=8).get_cache_vars()[-3:]
+
+    assert caches[0].shape == (2, 20, args.index_head_dim)
+    assert caches[1].numel() == 1
+    assert caches[2].numel() == 1
+
+
+def test_pure_mla_allocates_only_kvpe_cache(monkeypatch):
+    monkeypatch.setattr(torch, "zeros", _cpu_tensor_factory(torch.zeros))
+    monkeypatch.setattr(torch, "empty", _cpu_tensor_factory(torch.empty))
+    args = ModelArgsGLM5(max_seq_len=17, kv_cache_pad=3, max_batch_size=2)
+
+    caches = PureMlaV2(args, device_id=1, num_devices=7).get_cache_vars()[-3:]
+
+    assert caches[0].numel() == 1
+    assert caches[1].shape == (2, 20, args.kv_lora_rank)
+    assert caches[2].shape == (2, 20, args.qk_rope_head_dim)
+
+
+def _cpu_tensor_factory(factory):
+    def make_cpu_tensor(*args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs["device"] = "cpu"
+        return factory(*args, **kwargs)
+
+    return make_cpu_tensor
+
+
+def _make_device_caches(rows: int) -> list[torch.Tensor]:
+    caches = []
+    for _ in range(N_LAYERS):
+        caches.extend(
+            (
+                torch.zeros(1, rows, 128, dtype=torch.bfloat16),
+                torch.zeros(1, rows, 512, dtype=torch.bfloat16),
+                torch.zeros(1, rows, 64, dtype=torch.bfloat16),
+            )
+        )
+    return caches
